@@ -432,11 +432,14 @@ def tg_bir(iid, url, chat_id, sec="full", meta=None, dev=False, olcu=None):
             _is_durum(iid, "birlestirme")
             tg_get("sendMessage", {"chat_id": chat_id,
                                    "text": "🧵 Parçalar sohbete indi — üstüne TEK-PARÇA birleşik kopyayı da kuruyorum (1-2 dk)…"})
+            print("   [i] BIRLESTIR basli: %d parca" % len(fs))
             tk = birlestir(fs, out)
+            print("   [i] BIRLESTIR ok: %s (%d KB)" % (tk.name if tk else "-", tk.stat().st_size//1024 if tk else 0))
             if tk:
                 tg_get("sendChatAction", {"chat_id": chat_id, "action": "upload_document"})
                 tg_doc(chat_id, tk, "🖼 TEK PARÇA — ORIJINAL birleşik • %d KB" % (tk.stat().st_size // 1024))
-        except Exception:
+        except Exception as _be:
+            print("   [i] BIRLESTIR HATA:", repr(_be)[:120])
             tg_get("sendMessage", {"chat_id": chat_id,
                                    "text": "ℹ️ Birleşik kopya bu denemedi kurulamadı; parçalar eksiksiz sohbette."})
     if basarisiz:
