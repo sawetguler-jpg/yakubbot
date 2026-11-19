@@ -342,6 +342,34 @@ def _gozcu_cagri():
     threading.Thread(target=_recover, daemon=True).start()
 
 
+def birlestir(fs, out_klasor):
+    """Bant-JPG'leri piksel-perfect dikey-birleştir → tek-ORIJINAL jpg. (Küçük-RAM: sıra-dekod)"""
+    from PIL import Image
+    olcer = []
+    for d in fs:
+        with Image.open(d) as im:
+            olcer.append(im.size)
+    gen = min(w for w, _ in olcer)
+    ty = sum(h for _, h in olcer)
+    if gen * ty > 85_000_000:
+        return None
+    cnv = Image.new("RGB", (gen, ty))
+    y = 0
+    for d, (gw, gh) in zip(fs, olcer):
+        with Image.open(d) as im:
+            cnv.paste(im if im.mode == "RGB" else im.convert("RGB"), (0, y))
+        y += gh
+        import gc as _g
+        _g.collect()
+    kok = fs[0].name.split("__")[0]
+    bir = Path(out_klasor) / ("%s__BIRLESIK.jpg" % kok)
+    cnv.save(bir, quality=92)
+    del cnv
+    import gc as _g
+    _g.collect()
+    return bir
+
+
 def tg_bir(iid, url, chat_id, sec="full", meta=None, dev=False, olcu=None):
     """Tek-deneme: ACK -> (full|half) cekim -> doc'lar -> kunye."""
     EB = getattr(KC, "EserBulunamadi", ())
@@ -399,6 +427,18 @@ def tg_bir(iid, url, chat_id, sec="full", meta=None, dev=False, olcu=None):
                 time.sleep(3); tg_doc(chat_id, d, cap + " (yeniden)")
             except Exception:
                 basarisiz.append(d.name)
+    if not basarisiz and len(fs) > 1:
+        try:
+            _is_durum(iid, "birlestirme")
+            tg_get("sendMessage", {"chat_id": chat_id,
+                                   "text": "🧵 Parçalar sohbete indi — üstüne TEK-PARÇA birleşik kopyayı da kuruyorum (1-2 dk)…"})
+            tk = birlestir(fs, out)
+            if tk:
+                tg_get("sendChatAction", {"chat_id": chat_id, "action": "upload_document"})
+                tg_doc(chat_id, tk, "🖼 TEK PARÇA — ORIJINAL birleşik • %d KB" % (tk.stat().st_size // 1024))
+        except Exception:
+            tg_get("sendMessage", {"chat_id": chat_id,
+                                   "text": "ℹ️ Birleşik kopya bu denemedi kurulamadı; parçalar eksiksiz sohbette."})
     if basarisiz:
         tg_get("sendMessage", {"chat_id": chat_id,
                                "text": "⚠️ %d bölüm taşınmadı (%s) — az sonra tek-tek yenilerim." % (len(basarisiz), ", ".join(basarisiz)[:60])})
