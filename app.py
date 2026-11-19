@@ -285,11 +285,13 @@ def _is_durum(iid, durum):
 
 
 def _is_baslat(iid, url, chat_id, sifirdan=True):
-    t = threading.Thread(target=tg_job, args=((iid, url, chat_id), kay.get("sec")), daemon=True)
     with JOBS_K:
         kayit = JOBS.setdefault(iid, {"durum": "kuyruk", "t0": time.time(), "son": time.time(), "rest": 0, "url": url, "chat": chat_id})
         if sifirdan:
             kayit.update({"rest": 0, "t0": time.time()})
+    kaykay_sec = kayit.get("sec")
+    t = threading.Thread(target=tg_job, args=((iid, url, chat_id), kaykay_sec), daemon=True)
+    with JOBS_K:
         kayit["th"] = t
     _defter_yaz()
     t.start()
