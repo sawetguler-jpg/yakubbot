@@ -3,7 +3,7 @@
 """
 ketEBE-CEKER v1.1 — beta.ketebe.org eser sayfasindan TAM COZUNURLUK goruntuleri.
 Yontem: DZI (DeepZoom) piramidinin en-ust katmanini karo-karo indir, piksel-hassas dik.
-ZIRHLAR (v1.1):
+ZIRHLAR (v1.1) + KUNYE (v1.2):
   * Eser-sayfasi-yok -> EserBulunamadi (ciril-404-asla-disari-cikmaz)
   * Piramit-yok/eksik -> proxy-yedek merdiveni: detail -> card (en-buyuk-mevcut)
   * Bozuk/eksik-karo (<%95 doluluk) -> montaj-red + yedek-merdiven
@@ -21,7 +21,7 @@ from pathlib import Path
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) KetEBE-Ceker/1.1"}
 DELAY = 0.12
-__version__ = "1.1"
+__version__ = "1.2"
 
 
 class EserHata(Exception):
@@ -80,6 +80,109 @@ def eser_analiz(url):
         raise EserBulunamadi("Sayfa acti ama Gorsel-kaydi gorunmuyor; bu eser islenmemis olabilir.")
     return baslik, sorted(yollar)
 
+
+
+
+# ---------------- kunye (v1.2) ----------------
+def _ld_artwork(ham):
+    """Sayfadaki JSON-LD @graph icerisindeki VisualArtwork dugumu (yoksa {})."""
+    for b in re.findall(r'<script type="application/ld\+json">(.*?)</script>', ham, re.S):
+        try:
+            g = json.loads(b).get("@graph") or []
+        except Exception:
+            continue
+        for dugum in g:
+            if isinstance(dugum, dict) and dugum.get("@type") == "VisualArtwork":
+                return dugum
+    return {}
+
+
+def _katkilar(ham):
+    """'Katkida bulunanlar' bolumundeki (ad, meta-satiri) ciftleri."""
+    cikti = []
+    i = ham.find("Katkıda bulunanlar")
+    if i < 0:
+        return cikti
+    seg = ham[i:i + 4000]
+    for li in re.findall(r"<li.*?</li>", seg, re.S):
+        sp = [htmlmod.unescape(re.sub("<[^>]+>", " ", x)).strip() for x in
+              re.findall(r"<span[^>]*>(.*?)</span>", li, re.S)]
+        sp = [re.sub(r"\s+", " ", x) for x in sp if x]
+        if sp:
+            ad = sp[0]
+            meta = sp[1] if len(sp) > 1 else ""
+            cikti.append((ad[:70], meta[:110]))
+    return cikti
+
+
+def _uzun_paragraflar(ham):
+    """Kunye-degeri uzun 'icerik/ornek metin' paragraflari (varsa)."""
+    icerik_bas = ham.find("Katkıda bulunanlar")
+    tur_bas = ham.find("Eser türü")
+    dilim = ham[icerik_bas: tur_bas if tur_bas > icerik_bas else icerik_bas + 9000]
+    paragraf = []
+    for p in re.findall(r"<p[^>]*>(.*?)</p>", dilim, re.S):
+        metin = htmlmod.unescape(re.sub("<[^>]+>", " ", p))
+        metin = re.sub(r"\s+", " ", metin).strip()
+        if len(metin) >= 70:
+            paragraf.append(metin)
+    return paragraf
+
+
+def eser_meta(url):
+    """Eser-soylu bilgisi: baslik, alternatif, turler, malzeme, sanatcilar, aciklama."""
+    try:
+        ham = get(url).decode("utf-8", errors="replace")
+    except Exception as e:
+        raise _insansi_hata(e)
+    ld = _ld_artwork(ham)
+    alternatif = []
+    for a in ld.get("alternateName") or []:
+        if isinstance(a, str) and a.strip():
+            alternatif.append(a.strip())
+    yaraticilar = []
+    for c in ld.get("creator") or []:
+        if isinstance(c, dict) and c.get("name"):
+            yaraticilar.append(str(c["name"])[:70])
+    yaraticilar = yaraticilar or [ad for ad, _m in _katkilar(ham)]
+    meta_satirlari = [m for _a, m in _katkilar(ham) if m]
+    icerik = _uzun_paragraflar(ham)
+    turler = [str(t) for t in (ld.get("artform") or []) if str(t).strip()]
+    malzeme = [str(t) for t in (ld.get("artMedium") or []) if str(t).strip()]
+    return {
+        "baslik": str(ld.get("name") or "")[:90],
+        "alternatif": alternatif[:3],
+        "turler": turler[:6],
+        "malzeme": malzeme[:6],
+        "sanatcilar": yaraticilar[:4],
+        "meta_satirlari": meta_satirlari[:3],
+        "icerik": " ".join(icerik[:2])[:420],
+        "ozet": str(ld.get("description") or "")[:220],
+    }
+
+
+def kunye_format(meta, url):
+    """Eser-kunyesi -> insan-dostu TR metni (TG mesaji)."""
+    satir = []
+    if meta.get("baslik"):
+        satir.append("🏛 %s" % meta["baslik"])
+    for a in meta.get("alternatif", []):
+        satir.append("🔤 %s" % a)
+    for ad in meta.get("sanatcilar", []):
+        satir.append("👤 %s" % ad)
+    for ms in meta.get("meta_satirlari", []):
+        satir.append("📅 %s" % ms)
+    if meta.get("turler"):
+        satir.append("📂 Eser türü: %s" % ", ".join(meta["turler"]))
+    if meta.get("malzeme"):
+        satir.append("🧪 Teknik-malzeme: %s" % ", ".join(meta["malzeme"]))
+    govde = meta.get("icerik") or meta.get("ozet")
+    if govde:
+        satir.append("\n📝 %s" % govde)
+    if url:
+        satir.append("🔗 %s" % url)
+    metin = "\n".join(satir).strip()
+    return metin[:1100] if metin else ""
 
 def dzi_oku(uuid, tarih):
     """DZI metadata -> (W,H,ts,ov,fmt) ya da None (piramit-yok)."""

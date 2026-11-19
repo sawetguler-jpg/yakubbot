@@ -187,6 +187,15 @@ def dosya(iid: str, n: int):
     return FileResponse(str(p), media_type="image/jpeg", filename=p.name)
 
 
+@app.get("/api/meta/{eser}")
+def api_meta(eser: str):
+    u = "https://beta.ketebe.org/eserler/" + eser.strip("/ ")
+    try:
+        return KC.eser_meta(u)
+    except Exception as e:
+        return JSONResponse({"hata": str(e)[:160]}, status_code=400)
+
+
 # ---------------- TELEGRAM-WEBHOOK ----------------
 def tg_get(yol, params, zaman=30):
     q = urllib.parse.urlencode(params)
@@ -215,31 +224,101 @@ def tg_doc(chat_id, p: Path, cap: str):
         return {"ok": False, "description": str(e)}
 
 
+JOBS: dict[str, dict] = {}
+JOBS_K = threading.Lock()
+
+
+def _is_durum(iid, durum):
+    with JOBS_K:
+        if iid in JOBS:
+            JOBS[iid]["durum"] = durum
+            JOBS[iid]["son"] = time.time()
+
+
+def _is_baslat(iid, url, chat_id):
+    t = threading.Thread(target=tg_job, args=((iid, url, chat_id),), daemon=True)
+    with JOBS_K:
+        JOBS.setdefault(iid, {"durum": "kuyruk", "t0": time.time(), "son": time.time(), "rest": 0, "url": url, "chat": chat_id})
+        JOBS[iid]["th"] = t
+    t.start()
+    return t
+
+
+def _canbakici():
+    """Thread sessizce olmussa isleri gozler; 1 kez 5-sn-molayla yeniden dogurtur."""
+    while True:
+        time.sleep(5)
+        su = time.time()
+        for iid in list(JOBS.keys()):
+            with JOBS_K:
+                j = JOBS.get(iid)
+            if not j:
+                continue
+            if j["durum"] in ("bitti", "hata"):
+                if su - j.get("son", 0) > 3600:
+                    with JOBS_K:
+                        JOBS.pop(iid, None)
+                continue
+            th = j.get("th")
+            if th is not None and not th.is_alive() and su - j.get("son", 0) > 8:
+                if j.get("rest", 0) < 1:
+                    with JOBS_K:
+                        JOBS[iid]["rest"] = JOBS[iid].get("rest", 0) + 1
+                    tg_get("sendMessage", {"chat_id": j["chat"],
+                                           "text": "👀 Başlangıçta bir aksama fark ettim — 5 sn içinde yeniden başlatıyorum…" if su - j["t0"] < 45 else "👀 İş ortasında sessizlik fark ettim — 5 sn içinde yeniden deniyorum…"})
+                    time.sleep(5)
+                    _is_baslat(iid, j["url"], j["chat"])
+            elif th is not None and th.is_alive() and su - j.get("son", 0) > 90:
+                tg_get("sendMessage", {"chat_id": j["chat"], "text": "🫀 Hâlâ çalışıyorum (büyük eser, sabır)…"})
+                with JOBS_K:
+                    JOBS[iid]["son"] = time.time()
+
+
+@app.on_event("startup")
+def _gozcu_cagri():
+    threading.Thread(target=_canbakici, daemon=True).start()
+
+
 def tg_bir(iid, url, chat_id):
+    """Tek-deneme: analiz->ACK->dosyalar->kunye. Durumlari JOBS'a isler."""
+    _is_durum(iid, "analiz")
     tg_get("sendChatAction", {"chat_id": chat_id, "action": "upload_document"})
     out = CALISMA / iid
     out.mkdir(parents=True, exist_ok=True)
-    baslik, _y = KC.eser_analiz(url)
+    try:
+        meta = KC.eser_meta(url)
+        baslik = meta.get("baslik") or ""
+    except Exception:
+        meta, baslik = {}, ""
+    _is_durum(iid, "indirme")
+    tg_get("sendMessage", {"chat_id": chat_id, "text": ("▶️ İndirme BAŞLADI: %s\n⏳ tahmini 10–60 sn" % (baslik or url.rsplit('/', 1)[-1]))[:300]})
     klasorler = KC.eser_cek(url, out)
     fs = [f for k in klasorler for f in sorted(Path(k).glob("*_TAM.jpg"))]
     if not fs:
-        tg_get("sendMessage", {"chat_id": chat_id, "text": "ⓘ görsel bulamadım (%s)" % iid})
-        return
+        raise RuntimeError("goruntu-uretilemedi")
+    _is_durum(iid, "gonderim")
     for i, d in enumerate(fs, 1):
         tg_get("sendChatAction", {"chat_id": chat_id, "action": "upload_document"})
-        cap = "🏛 %s\n📐 TAM-ÇÖZÜNÜRLÜK • %d KB [%d/%d]" % (baslik[:60], d.stat().st_size // 1024, i, len(fs))
+        cap = "🏛 %s\n📐 TAM-ÇÖZÜNÜRLÜK • %d KB [%d/%d]" % ((baslik or "Eser")[:60], d.stat().st_size // 1024, i, len(fs))
         tg_doc(chat_id, d, cap)
+    ktext = ""
+    try:
+        ktext = KC.kunye_format(meta, url) if meta else ""
+    except Exception:
+        ktext = ""
+    if ktext:
+        tg_get("sendMessage", {"chat_id": chat_id, "text": "📘 ESER KÜNYESİ\n" + ktext})
     shutil.rmtree(out, ignore_errors=True)
+    _is_durum(iid, "bitti")
 
 
 TG_BEK = (5, 10)
 
 
 def tg_job(iid_url_chat):
-    """v1.2: oto-tekrar (5,10 sn) + nazik baglanti uyarlari."""
+    """v1.3: oto-tekrar (5,10 sn) + durum-kayit + nazik-uyarilar."""
     iid, url, chat_id = iid_url_chat
     EB = getattr(KC, "EserBulunamadi", ())
-    GH = getattr(KC, "GeciciHata", ())
     sebep = ""
     for deneme in range(1, 4):
         if deneme > 1:
@@ -254,10 +333,13 @@ def tg_job(iid_url_chat):
             return
         except Exception as e:
             if EB and isinstance(e, EB):
-                tg_get("sendMessage", {"chat_id": chat_id, "text": "🔎 Bu numarada eser görünmüyor. Linki/numarayı kontrol eder misin?"})
+                tg_get("sendMessage", {"chat_id": chat_id,
+                                       "text": "🔎 Bu numarada eser görünmüyor. Linki/numarayı kontrol eder misin? (yayından kalkmış/dijitalleşmemiş olabilir)"})
+                _is_durum(iid, "hata")
                 return
             ag = isinstance(e, (urllib.error.URLError, TimeoutError, ConnectionError, OSError))
             sebep = "baglanti" if ag else "gecici"
+            _is_durum(iid, "tekrar")
     site = tg = False
     try:
         import socket as _s
@@ -276,6 +358,7 @@ def tg_job(iid_url_chat):
     else:
         m = "😕 Denemelerde olmadı; Ketebe yoğun olabilir. Birkaç dakika sonra tekrar dener misin?"
     tg_get("sendMessage", {"chat_id": chat_id, "text": m})
+    _is_durum(iid, "hata")
 
 
 @app.post("/webhook")
@@ -292,10 +375,9 @@ async def webhook(req: Request):
     if chat_id and metin:
         url = url_valid(metin)
         if url:
-            tg_get("sendMessage", {"chat_id": chat_id, "text": "🔍 %s → tam-çözünürlük hazırlanıyorum (10-60 sn)" % url.rsplit("/", 1)[-1]})
             iid = uuid.uuid4().hex[:10]
-            ISLER[iid] = {"durum": "tg", "ad": ""}
-            threading.Thread(target=tg_job, args=((iid, url, chat_id),), daemon=True).start()
+            tg_get("sendMessage", {"chat_id": chat_id, "text": "🔍 %s → tam-çözünürlük hazırlanıyorum (10-60 sn)" % url.rsplit("/", 1)[-1]})
+            _is_baslat(iid, url, chat_id)
         elif metin.startswith("/start"):
             tg_get("sendMessage", {"chat_id": chat_id, "text": "📚 Yakub Ketebe İndir!\nEser numarası veya linki yolla (örn 8680)."})
         else:
