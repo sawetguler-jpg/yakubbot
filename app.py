@@ -226,6 +226,23 @@ def tg_doc(chat_id, p: Path, cap: str):
 
 JOBS: dict[str, dict] = {}
 JOBS_K = threading.Lock()
+LEDGER = CALISMA / "durum-defteri.json"
+
+
+def _defter_yaz():
+    try:
+        with JOBS_K:
+            oz = {k: {kk: v[kk] for kk in ("durum", "url", "chat", "t0") if kk in v} for k, v in JOBS.items()}
+        LEDGER.write_text(json.dumps(oz, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _defter_oku():
+    try:
+        return json.loads(LEDGER.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
 
 def _is_durum(iid, durum):
@@ -233,13 +250,17 @@ def _is_durum(iid, durum):
         if iid in JOBS:
             JOBS[iid]["durum"] = durum
             JOBS[iid]["son"] = time.time()
+    _defter_yaz()
 
 
-def _is_baslat(iid, url, chat_id):
+def _is_baslat(iid, url, chat_id, sifirdan=True):
     t = threading.Thread(target=tg_job, args=((iid, url, chat_id),), daemon=True)
     with JOBS_K:
-        JOBS.setdefault(iid, {"durum": "kuyruk", "t0": time.time(), "son": time.time(), "rest": 0, "url": url, "chat": chat_id})
-        JOBS[iid]["th"] = t
+        kayit = JOBS.setdefault(iid, {"durum": "kuyruk", "t0": time.time(), "son": time.time(), "rest": 0, "url": url, "chat": chat_id})
+        if sifirdan:
+            kayit.update({"rest": 0, "t0": time.time()})
+        kayit["th"] = t
+    _defter_yaz()
     t.start()
     return t
 
@@ -277,6 +298,15 @@ def _canbakici():
 @app.on_event("startup")
 def _gozcu_cagri():
     threading.Thread(target=_canbakici, daemon=True).start()
+    # v1.4 RESTART-SAGLIKCI: instance yenilendiyse yarim-kalan islere "devam" der
+    def _recover():
+        time.sleep(6)
+        for iid, kay in _defter_oku().items():
+            if kay.get("durum") in ("kuyruk", "analiz", "indirme", "gonderim", "tekrar"):
+                tg_get("sendMessage", {"chat_id": kay["chat"],
+                                       "text": "🔁 Sunucu kısa bir bakım geçirdi; işin kaldığı yerden sürüyor…"})
+                _is_baslat(iid, kay["url"], kay["chat"], sifirdan=False)
+    threading.Thread(target=_recover, daemon=True).start()
 
 
 def tg_bir(iid, url, chat_id):
@@ -290,8 +320,19 @@ def tg_bir(iid, url, chat_id):
         baslik = meta.get("baslik") or ""
     except Exception:
         meta, baslik = {}, ""
+    # v1.4 dev-eser sezgi: ilk-gorselin DZI olculeri ->_MP
+    dev_uvari = ""
+    try:
+        _yollar = KC.eser_analiz(url)[1]
+        if _yollar:
+            _par = _yollar[0].split("/")
+            _m = KC.dzi_oku(_par[-1].rsplit(".", 1)[0], "/".join(_par[:2]))
+            if _m and _m[0] * _m[1] > 12_000_000:
+                dev_uvari = "\n🐉 BU ESER DEVASA: %dx%d piksel — 1-3 dakika sürebilir, telaş yok (susmuyorum)" % (_m[0], _m[1])
+    except Exception:
+        pass
     _is_durum(iid, "indirme")
-    tg_get("sendMessage", {"chat_id": chat_id, "text": ("▶️ İndirme BAŞLADI: %s\n⏳ tahmini 10–60 sn" % (baslik or url.rsplit('/', 1)[-1]))[:300]})
+    tg_get("sendMessage", {"chat_id": chat_id, "text": ("▶️ İndirme BAŞLADI: %s\n⏳ tahmini 10–60 sn%s" % ((baslik or url.rsplit('/', 1)[-1]), dev_uvari))[:400]})
     klasorler = KC.eser_cek(url, out)
     fs = [f for k in klasorler for f in sorted(Path(k).glob("*_TAM.jpg"))]
     if not fs:
