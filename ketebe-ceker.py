@@ -21,7 +21,7 @@ from pathlib import Path
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) KetEBE-Ceker/1.1"}
 DELAY = 0.12
-__version__ = "1.3"
+__version__ = "1.4"
 
 
 class EserHata(Exception):
@@ -215,15 +215,21 @@ def karo_indir(u):
     return None
 
 
-def dik_dizi_stitch(tiles, W, H, ts, ov, cols, rows, hedef, min_doluluk=0.95):
-    """Feather'li montaj. Doluluk<min -> ValueError (yedek-merdivene dus)."""
+def dik_dizi_stitch(tiles, W, H, ts, ov, cols, rows, hedef, min_doluluk=0.95, satir_araligi=None):
+    """Feather'li montaj. satir_araligi=(r0,r1,y_top,y_bot) verilirse BANT-modu (RAM-dostu)."""
     from PIL import Image
+    if satir_araligi:
+        r0, r1, y_top, y_bot = satir_araligi
+        toplam = (r1 - r0) * cols
+    else:
+        r0, r1, y_top, y_bot = 0, rows, 0, H
+        toplam = cols * rows
     gercek = {k: v for k, v in tiles.items() if v}
-    doluluk = len(gercek) / float(cols * rows)
+    doluluk = len(gercek) / float(toplam)
     if doluluk < min_doluluk or not gercek:
-        raise ValueError("karolar eksik (%d/%d)" % (len(gercek), cols * rows))
-    cnv = Image.new("RGB", (W, H))
-    for r in range(rows):
+        raise ValueError("karolar eksik (%d/%d)" % (len(gercek), toplam))
+    cnv = Image.new("RGB", (W, y_bot - y_top))
+    for r in range(r0, r1):
         for c in range(cols):
             veri = gercek.get((c, r))
             if not veri:
@@ -238,17 +244,17 @@ def dik_dizi_stitch(tiles, W, H, ts, ov, cols, rows, hedef, min_doluluk=0.95):
             ox, oy = c * ts - (ov if c > 0 else ov) + cx0, r * ts - (ov if r > 0 else ov) + cy0
             if ox >= W or oy >= H:
                 continue
-            cnv.paste(t2, (ox, oy))
+            cnv.paste(t2, (ox, oy - y_top))
             if c > 0 and ov > 0:
-                sol = cnv.crop((ox - 1, oy, ox, oy + t2.height))
-                sag = cnv.crop((ox + 1, oy, ox + 2, oy + t2.height))
+                sol = cnv.crop((ox - 1, oy - y_top, ox, oy - y_top + t2.height))
+                sag = cnv.crop((ox + 1, oy - y_top, ox + 2, oy - y_top + t2.height))
                 if sag.size[0] > 0:
-                    cnv.paste(Image.blend(sol, sag, 0.5), (ox, oy))
+                    cnv.paste(Image.blend(sol, sag, 0.5), (ox, oy - y_top))
             if r > 0 and ov > 0:
-                ust = cnv.crop((ox, oy - 1, ox + t2.width, oy))
-                alt = cnv.crop((ox, oy + 1, ox + t2.width, oy + 2))
+                ust = cnv.crop((ox, oy - y_top - 1, ox + t2.width, oy - y_top))
+                alt = cnv.crop((ox, oy - y_top + 1, ox + t2.width, oy - y_top + 2))
                 if alt.size[1] > 0:
-                    cnv.paste(Image.blend(ust, alt, 0.5), (ox, oy))
+                    cnv.paste(Image.blend(ust, alt, 0.5), (ox, oy - y_top))
     cnv.save(hedef, quality=95, optimize=True)
     return doluluk
 
@@ -267,9 +273,10 @@ def yedek_proxy(tarih, uuid_str, hedef):
     raise EserBulunamadi("Ne piramit ne proxy-gorsel erisilebilir; eser henuz islenmemis olabilir.")
 
 
-def eser_cek(url, cikti_kok, seviye_ofseti=0):
+def eser_cek(url, cikti_kok, seviye_ofseti=0, serit_hedef_mb=8):
     """-> uretilen dosya-yollari (str list). Hata-insan-dostu EserHata agaci.
-    seviye_ofseti=-1 -> piramidin bir-alt katmani (yaklasik yarim olculer, 4x hizli)."""
+    seviye_ofseti=-1 -> piramidin bir-alt katmani (yaklasik yarim olculer, 4x hizli).
+    serit_hedef_mb>0 -> 30MP-uzeri eser yatay BANTLARA bolunur (RAM-dostu; TG-upload hafif)."""
     cikti_kok = Path(cikti_kok); cikti_kok.mkdir(parents=True, exist_ok=True)
     baslik, yollar = eser_analiz(url)
     eser_no = str(url).rstrip("/").rsplit("/", 1)[-1]
@@ -302,19 +309,47 @@ def eser_cek(url, cikti_kok, seviye_ofseti=0):
             hl = math.ceil(H / (2 ** fark))
             cols, rows = math.ceil(wl / ts), math.ceil(hl / ts)
             base = "https://media.ketebe.org/dzi/%s/%s_files/%d" % (tarih, uuid_str, mx)
-            jobs = [(c, r, "%s/%d_%d.%s" % (base, c, r, fmt)) for c in range(cols) for r in range(rows)]
-            tiles = {}
-            with cf.ThreadPoolExecutor(6) as ex:
-                for (c, r), veri in zip([(c, r) for c, r, _ in jobs], ex.map(lambda j: karo_indir(j[2]), jobs)):
-                    tiles[(c, r)] = veri
-                time.sleep(0)
             time.sleep(DELAY)
             try:
-                hedef = klasor / ("%s__%dx%d_TAM.jpg" % (guvenli, wl, hl))
-                dol = dik_dizi_stitch(tiles, wl, hl, ts, ov, cols, rows, hedef)
-                print("   [%d] piramit-stitch %dx%d (%.0f%% karo) -> %s (%.0f KB)"
-                      % (n, wl, hl, dol * 100, hedef.name, hedef.stat().st_size / 1024))
-                uretildi = hedef
+                if serit_hedef_mb <= 0 or wl * hl <= 30_000_000:
+                    jobs = [(c, r, "%s/%d_%d.%s" % (base, c, r, fmt)) for c in range(cols) for r in range(rows)]
+                    tiles = {}
+                    with cf.ThreadPoolExecutor(6) as ex:
+                        for (c, r), veri in zip([(c, r) for c, r, _ in jobs], ex.map(lambda j: karo_indir(j[2]), jobs)):
+                            tiles[(c, r)] = veri
+                    hedef = klasor / ("%s__%dx%d_TAM.jpg" % (guvenli, wl, hl))
+                    dol = dik_dizi_stitch(tiles, wl, hl, ts, ov, cols, rows, hedef)
+                    del tiles
+                    print("   [%d] piramit-stitch %dx%d (%.0f%% karo) -> %s (%.0f KB)"
+                          % (n, wl, hl, dol * 100, hedef.name, hedef.stat().st_size / 1024))
+                    uretildi = hedef
+                else:
+                    tahmin_mb = wl * hl * 4 / 1e6 * 0.09
+                    adet = max(2, min(6, math.ceil(tahmin_mb / max(2.0, serit_hedef_mb))))
+                    rpb = math.ceil(rows / adet)
+                    bantlar = []
+                    for bi in range(adet):
+                        r0, r1 = bi * rpb, min((bi + 1) * rpb, rows)
+                        if r0 >= r1:
+                            break
+                        tiles = {}
+                        jb = [(c, r, "%s/%d_%d.%s" % (base, c, r, fmt)) for c in range(cols) for r in range(r0, r1)]
+                        with cf.ThreadPoolExecutor(4) as ex:
+                            for (c, r), veri in zip([(c, r) for c, r, _ in jb], ex.map(lambda j: karo_indir(j[2]), jb)):
+                                tiles[(c, r)] = veri
+                        y_top = r0 * ts - (ov if r0 > 0 else 0)
+                        y_bot = min((r1 - 1) * ts - (ov if (r1 - 1) > 0 else 0) + ts, hl)
+                        byol = klasor / ("%s__%dx%d_TAM.bolum%d-%d.jpg" % (guvenli, wl, hl, bi + 1, adet))
+                        dik_dizi_stitch(tiles, wl, hl, ts, ov, cols, rows, byol,
+                                        satir_araligi=(r0, r1, y_top, y_bot))
+                        del tiles
+                        import gc as _gc
+                        _gc.collect()
+                        bantlar.append(byol)
+                        print("   [%d] bant %d/%d y=[%d:%d] -> %s (%.0f KB)"
+                              % (n, bi + 1, adet, y_top, y_bot, byol.name, byol.stat().st_size / 1024))
+                    if bantlar:
+                        uretildi = bantlar[0]
             except ValueError as e:
                 print("   ! piramit-yetersiz (%s) -> yedek-merdivene" % e)
         if uretildi is None:
@@ -324,7 +359,7 @@ def eser_cek(url, cikti_kok, seviye_ofseti=0):
         ciktilar.append(str(klasor))
         (klasor / "manifest.json").write_text(json.dumps({
             "kaynak": url, "eser_no": eser_no, "baslik": baslik, "master_yolu": yol,
-            "cocuk": uretildi.name, "surum": __version__,
+            "cocuk": getattr(uretildi, "name", str(uretildi)), "surum": __version__,
             "tarih": time.strftime("%Y-%m-%d %H:%M")
         }, ensure_ascii=False, indent=1), encoding="utf-8")
     return ciktilar

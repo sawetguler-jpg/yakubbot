@@ -61,7 +61,7 @@ def eser_isi(iid: str, url: str):
             klasorler = KC.eser_cek(url, out)
             dosyalar = []
             for k in klasorler:
-                dosyalar += sorted(Path(k).glob("*_TAM.jpg"))
+                dosyalar += sorted(Path(k).glob("*_TAM*.jpg"))
             if not dosyalar:
                 ISLER[iid]["durum"] = "hata"
                 ISLER[iid]["hata"] = "goruntu bulunamadi"
@@ -224,7 +224,7 @@ def tg_doc(chat_id, p: Path, cap: str):
     rq = urllib.request.Request("%s/bot%s/sendDocument" % (API, TG_TOKEN), data=b"".join(parts),
                                 headers={"Content-Type": "multipart/form-data; boundary=%s" % bnd})
     try:
-        with urllib.request.urlopen(rq, timeout=180) as r:
+        with urllib.request.urlopen(rq, timeout=600) as r:
             return json.loads(r.read().decode())
     except Exception as e:
         return {"ok": False, "description": str(e)}
@@ -238,7 +238,7 @@ LEDGER = CALISMA / "durum-defteri.json"
 def _defter_yaz():
     try:
         with JOBS_K:
-            oz = {k: {kk: v[kk] for kk in ("durum", "url", "chat", "t0") if kk in v} for k, v in JOBS.items()}
+            oz = {k: {kk: v[kk] for kk in ("durum", "url", "chat", "t0", "sec") if kk in v} for k, v in JOBS.items()}
         LEDGER.write_text(json.dumps(oz, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
@@ -257,6 +257,12 @@ SECIM: dict[str, dict] = {}
 
 def secim_kur(iid):
     SECIM[iid] = {"ev": threading.Event(), "sec": ""}
+
+
+def sec_i_yaz(iid, sec):
+    with JOBS_K:
+        if iid in JOBS:
+            JOBS[iid]["sec"] = sec
 
 
 def secim_bekle(iid, tmo=600):
@@ -279,7 +285,7 @@ def _is_durum(iid, durum):
 
 
 def _is_baslat(iid, url, chat_id, sifirdan=True):
-    t = threading.Thread(target=tg_job, args=((iid, url, chat_id),), daemon=True)
+    t = threading.Thread(target=tg_job, args=((iid, url, chat_id), kay.get("sec")), daemon=True)
     with JOBS_K:
         kayit = JOBS.setdefault(iid, {"durum": "kuyruk", "t0": time.time(), "son": time.time(), "rest": 0, "url": url, "chat": chat_id})
         if sifirdan:
@@ -355,21 +361,22 @@ def tg_bir(iid, url, chat_id, sec="full", meta=None, dev=False, olcu=None):
                                     % (etiket, baslik or url.rsplit('/', 1)[-1], ek_dev))[:400]})
     ofset = 0 if sec == "full" else -1
     try:
-        klasorler = KC.eser_cek(url, out, seviye_ofseti=ofset)
+        klasorler = KC.eser_cek(url, out, seviye_ofseti=ofset, serit_hedef_mb=8)
     except Exception as e:
         if EB and isinstance(e, EB):
             raise
         if sec == "full" and dev:
             tg_get("sendMessage", {"chat_id": chat_id,
                                    "text": "💥 Tam-kalite havada kaldı (%s) — ⚡ yarısını hazırlıyorum…" % str(e)[:70]})
-            klasorler = KC.eser_cek(url, out, seviye_ofseti=-1)
+            klasorler = KC.eser_cek(url, out, seviye_ofseti=-1, serit_hedef_mb=8)
             etiket = "YARIM (yedek)"
         else:
             raise
-    fs = [f for k in klasorler for f in sorted(Path(k).glob("*_TAM.jpg"))]
+    fs = [f for k in klasorler for f in sorted(Path(k).glob("*_TAM*.jpg"))]
     if not fs:
         raise RuntimeError("goruntu-uretilemedi")
     _is_durum(iid, "gonderim")
+    basarisiz = []
     for i, d in enumerate(fs, 1):
         tg_get("sendChatAction", {"chat_id": chat_id, "action": "upload_document"})
         olcub = ""
@@ -383,23 +390,33 @@ def tg_bir(iid, url, chat_id, sec="full", meta=None, dev=False, olcu=None):
         cap = "🏛 %s\n📐 %s%s • %d KB [%d/%d]" % ((baslik or "Eser")[:60],
                                                  "TAM-ÇÖZÜNÜRLÜK" if sec == "full" else "⚡ YARIM-ÇÖZÜNÜRLÜK",
                                                  olcub, d.stat().st_size // 1024, i, len(fs))
-        tg_doc(chat_id, d, cap)
-    ktext = ""
-    try:
-        ktext = KC.kunye_format(meta, url) if meta else ""
-    except Exception:
+        try:
+            tg_doc(chat_id, d, cap)
+        except Exception:
+            try:
+                time.sleep(3); tg_doc(chat_id, d, cap + " (yeniden)")
+            except Exception:
+                basarisiz.append(d.name)
+    if basarisiz:
+        tg_get("sendMessage", {"chat_id": chat_id,
+                               "text": "⚠️ %d bölüm taşınmadı (%s) — az sonra tek-tek yenilerim." % (len(basarisiz), ", ".join(basarisiz)[:60])})
+    else:
         ktext = ""
-    if ktext:
-        tg_get("sendMessage", {"chat_id": chat_id, "text": "📘 ESER KÜNYESİ\n" + ktext})
-    shutil.rmtree(out, ignore_errors=True)
+        try:
+            ktext = KC.kunye_format(meta, url) if meta else ""
+        except Exception:
+            ktext = ""
+        if ktext:
+            tg_get("sendMessage", {"chat_id": chat_id, "text": "📘 ESER KÜNYESİ\n" + ktext})
+        shutil.rmtree(out, ignore_errors=True)
     _is_durum(iid, "bitti")
 
 
 TG_BEK = (5, 10)
 
 
-def tg_job(iid_url_chat):
-    """v1.5: dev-eserde BUTON-SORUSU (orijinal/yarisi) + oto-tekrar + nezaket."""
+def tg_job(iid_url_chat, resume_sec=None):
+    """v1.6: dev-eserde BUTON-SORUSU (orijinal/yarisi) + oto-tekrar + nezaket."""
     iid, url, chat_id = iid_url_chat
     EB = getattr(KC, "EserBulunamadi", ())
     secim_kur(iid)
@@ -425,8 +442,13 @@ def tg_job(iid_url_chat):
     except Exception:
         pass
     dev = bool(olcu and olcu[0] * olcu[1] > 12_000_000)
-    sec = "full"
-    if dev:
+    sec = resume_sec or ""
+    if not sec:
+        with JOBS_K:
+            sec = JOBS.get(iid, {}).get("sec", "")
+    if not sec:
+        sec = "full"
+    if dev and resume_sec is None and not JOBS.get(iid, {}).get("sec"):
         kb = {"inline_keyboard": [[
             {"text": "🏛 Orijinal (%dx%d, 1-3 dk)" % olcu, "callback_data": "sec|%s|full" % iid},
             {"text": "⚡ Yarısı (%dx%d, 30-60 sn)" % (olcu[0] // 2, olcu[1] // 2), "callback_data": "sec|%s|half" % iid}]]}
@@ -438,6 +460,7 @@ def tg_job(iid_url_chat):
         if sec == "auto-full":
             tg_get("sendMessage", {"chat_id": chat_id, "text": "⏰ Seçim gelmedi — ORİJİNAL'i getiriyorum."})
         SECIM.pop(iid, None)
+        sec_i_yaz(iid, sec)
         _is_durum(iid, "kuyruk")
     sebep = ""
     for deneme in range(1, 4):
@@ -500,7 +523,8 @@ async def webhook(req: Request):
                 if sx and not sx["ev"].is_set():
                     sx["sec"] = sec
                     sx["ev"].set()
-                    cb_cevap(cq.get("id", ""), "🏛 Orijinal hazırlanıyor…" if sec == "full" else "⚡ Yarısı hazırlanıyor…")
+                sec_i_yaz(iid, sec)
+                cb_cevap(cq.get("id", ""), "🏛 Orijinal hazırlanıyor…" if sec == "full" else "⚡ Yarısı hazırlanıyor…")
         return PlainTextResponse("ok")
     m = upd.get("message") or {}
     chat_id = (m.get("chat") or {}).get("id")
