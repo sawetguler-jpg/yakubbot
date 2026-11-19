@@ -3,7 +3,7 @@
 """
 ketEBE-CEKER v1.1 — beta.ketebe.org eser sayfasindan TAM COZUNURLUK goruntuleri.
 Yontem: DZI (DeepZoom) piramidinin en-ust katmanini karo-karo indir, piksel-hassas dik.
-ZIRHLAR (v1.1) + KUNYE (v1.2):
+ZIRHLAR (v1.1) + KUNYE (v1.2) + SEVIYE-OFSETI (v1.3):
   * Eser-sayfasi-yok -> EserBulunamadi (ciril-404-asla-disari-cikmaz)
   * Piramit-yok/eksik -> proxy-yedek merdiveni: detail -> card (en-buyuk-mevcut)
   * Bozuk/eksik-karo (<%95 doluluk) -> montaj-red + yedek-merdiven
@@ -21,7 +21,7 @@ from pathlib import Path
 
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) KetEBE-Ceker/1.1"}
 DELAY = 0.12
-__version__ = "1.2"
+__version__ = "1.3"
 
 
 class EserHata(Exception):
@@ -267,8 +267,9 @@ def yedek_proxy(tarih, uuid_str, hedef):
     raise EserBulunamadi("Ne piramit ne proxy-gorsel erisilebilir; eser henuz islenmemis olabilir.")
 
 
-def eser_cek(url, cikti_kok):
-    """-> uretilen dosya-yollari (str list). Hata-insan-dostu EserHata agaci."""
+def eser_cek(url, cikti_kok, seviye_ofseti=0):
+    """-> uretilen dosya-yollari (str list). Hata-insan-dostu EserHata agaci.
+    seviye_ofseti=-1 -> piramidin bir-alt katmani (yaklasik yarim olculer, 4x hizli)."""
     cikti_kok = Path(cikti_kok); cikti_kok.mkdir(parents=True, exist_ok=True)
     baslik, yollar = eser_analiz(url)
     eser_no = str(url).rstrip("/").rsplit("/", 1)[-1]
@@ -283,9 +284,11 @@ def eser_cek(url, cikti_kok):
         uretildi = None
         if meta:
             W, H, ts, ov, fmt = meta
-            mx = max(0, math.ceil(math.log2(max(W, H, 1))))
-            # empirik max-seviye saglamasi
-            for seviye in (mx, mx - 1, mx + 1, mx + 2):
+            ust = max(1, math.ceil(math.log2(max(W, H, 1))))          # teorik tep katalog
+            efektif = max(1, ust + seviye_ofseti)
+            # empirik seviye saglamasi (secilen civarinda)
+            mx = efektif
+            for seviye in (efektif, efektif - 1, efektif + 1):
                 if seviye < 1:
                     continue
                 p = "https://media.ketebe.org/dzi/%s/%s_files/%d/0_0.%s" % (tarih, uuid_str, seviye, fmt)
@@ -293,8 +296,10 @@ def eser_cek(url, cikti_kok):
                     get(p, ikinci=1, zaman=20); mx = seviye; break
                 except Exception:
                     continue
-            kats = 2 ** (mx - mx)
-            wl, hl = W, H
+            # secilen katmanin gercek olculeri: ust katmana gore 2^fark oranla
+            fark = ust - mx
+            wl = math.ceil(W / (2 ** fark))
+            hl = math.ceil(H / (2 ** fark))
             cols, rows = math.ceil(wl / ts), math.ceil(hl / ts)
             base = "https://media.ketebe.org/dzi/%s/%s_files/%d" % (tarih, uuid_str, mx)
             jobs = [(c, r, "%s/%d_%d.%s" % (base, c, r, fmt)) for c in range(cols) for r in range(rows)]

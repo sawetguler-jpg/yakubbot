@@ -187,6 +187,12 @@ def dosya(iid: str, n: int):
     return FileResponse(str(p), media_type="image/jpeg", filename=p.name)
 
 
+@app.get("/api/isler")
+def api_isler():
+    with JOBS_K:
+        return {k: {"durum": v.get("durum"), "url": v.get("url")} for k, v in JOBS.items()}
+
+
 @app.get("/api/meta/{eser}")
 def api_meta(eser: str):
     u = "https://beta.ketebe.org/eserler/" + eser.strip("/ ")
@@ -245,6 +251,25 @@ def _defter_oku():
         return {}
 
 
+# ---- v1.5: BUTON-SECIM altsistemi ----
+SECIM: dict[str, dict] = {}
+
+
+def secim_kur(iid):
+    SECIM[iid] = {"ev": threading.Event(), "sec": ""}
+
+
+def secim_bekle(iid, tmo=600):
+    s = SECIM.get(iid)
+    if s and s["ev"].wait(tmo):
+        return s["sec"] or "full"
+    return "auto-full"
+
+
+def cb_cevap(cb_id, metin):
+    tg_get("answerCallbackQuery", {"callback_query_id": cb_id, "text": metin[:190]})
+
+
 def _is_durum(iid, durum):
     with JOBS_K:
         if iid in JOBS:
@@ -289,7 +314,7 @@ def _canbakici():
                                            "text": "👀 Başlangıçta bir aksama fark ettim — 5 sn içinde yeniden başlatıyorum…" if su - j["t0"] < 45 else "👀 İş ortasında sessizlik fark ettim — 5 sn içinde yeniden deniyorum…"})
                     time.sleep(5)
                     _is_baslat(iid, j["url"], j["chat"])
-            elif th is not None and th.is_alive() and su - j.get("son", 0) > 90:
+            elif th is not None and th.is_alive() and j["durum"] != "soru" and su - j.get("son", 0) > 90:
                 tg_get("sendMessage", {"chat_id": j["chat"], "text": "🫀 Hâlâ çalışıyorum (büyük eser, sabır)…"})
                 with JOBS_K:
                     JOBS[iid]["son"] = time.time()
@@ -309,38 +334,55 @@ def _gozcu_cagri():
     threading.Thread(target=_recover, daemon=True).start()
 
 
-def tg_bir(iid, url, chat_id):
-    """Tek-deneme: analiz->ACK->dosyalar->kunye. Durumlari JOBS'a isler."""
+def tg_bir(iid, url, chat_id, sec="full", meta=None, dev=False, olcu=None):
+    """Tek-deneme: ACK -> (full|half) cekim -> doc'lar -> kunye."""
+    EB = getattr(KC, "EserBulunamadi", ())
     _is_durum(iid, "analiz")
     tg_get("sendChatAction", {"chat_id": chat_id, "action": "upload_document"})
     out = CALISMA / iid
     out.mkdir(parents=True, exist_ok=True)
-    try:
-        meta = KC.eser_meta(url)
-        baslik = meta.get("baslik") or ""
-    except Exception:
-        meta, baslik = {}, ""
-    # v1.4 dev-eser sezgi: ilk-gorselin DZI olculeri ->_MP
-    dev_uvari = ""
-    try:
-        _yollar = KC.eser_analiz(url)[1]
-        if _yollar:
-            _par = _yollar[0].split("/")
-            _m = KC.dzi_oku(_par[-1].rsplit(".", 1)[0], "/".join(_par[:2]))
-            if _m and _m[0] * _m[1] > 12_000_000:
-                dev_uvari = "\n🐉 BU ESER DEVASA: %dx%d piksel — 1-3 dakika sürebilir, telaş yok (susmuyorum)" % (_m[0], _m[1])
-    except Exception:
-        pass
+    if meta is None:
+        try:
+            meta = KC.eser_meta(url)
+        except Exception:
+            meta = {}
+    baslik = meta.get("baslik") or ""
+    etiket = "ORIJINAL" if sec == "full" else "YARIM-COZUNURLUK"
+    ek_dev = ("\n🐉 DEV-ESER: %dx%d — 1-3 dk, telaş yok (susmuyorum)" % olcu) if (dev and olcu and sec == "full") else ""
     _is_durum(iid, "indirme")
-    tg_get("sendMessage", {"chat_id": chat_id, "text": ("▶️ İndirme BAŞLADI: %s\n⏳ tahmini 10–60 sn%s" % ((baslik or url.rsplit('/', 1)[-1]), dev_uvari))[:400]})
-    klasorler = KC.eser_cek(url, out)
+    tg_get("sendMessage", {"chat_id": chat_id,
+                           "text": ("▶️ İndirme BAŞLADI (%s): %s\n⏳ tahmini 10–60 sn%s"
+                                    % (etiket, baslik or url.rsplit('/', 1)[-1], ek_dev))[:400]})
+    ofset = 0 if sec == "full" else -1
+    try:
+        klasorler = KC.eser_cek(url, out, seviye_ofseti=ofset)
+    except Exception as e:
+        if EB and isinstance(e, EB):
+            raise
+        if sec == "full" and dev:
+            tg_get("sendMessage", {"chat_id": chat_id,
+                                   "text": "💥 Tam-kalite havada kaldı (%s) — ⚡ yarısını hazırlıyorum…" % str(e)[:70]})
+            klasorler = KC.eser_cek(url, out, seviye_ofseti=-1)
+            etiket = "YARIM (yedek)"
+        else:
+            raise
     fs = [f for k in klasorler for f in sorted(Path(k).glob("*_TAM.jpg"))]
     if not fs:
         raise RuntimeError("goruntu-uretilemedi")
     _is_durum(iid, "gonderim")
     for i, d in enumerate(fs, 1):
         tg_get("sendChatAction", {"chat_id": chat_id, "action": "upload_document"})
-        cap = "🏛 %s\n📐 TAM-ÇÖZÜNÜRLÜK • %d KB [%d/%d]" % ((baslik or "Eser")[:60], d.stat().st_size // 1024, i, len(fs))
+        olcub = ""
+        if sec != "full":
+            try:
+                from PIL import Image
+                with Image.open(d) as imx:
+                    olcub = " %dx%d" % imx.size
+            except Exception:
+                pass
+        cap = "🏛 %s\n📐 %s%s • %d KB [%d/%d]" % ((baslik or "Eser")[:60],
+                                                 "TAM-ÇÖZÜNÜRLÜK" if sec == "full" else "⚡ YARIM-ÇÖZÜNÜRLÜK",
+                                                 olcub, d.stat().st_size // 1024, i, len(fs))
         tg_doc(chat_id, d, cap)
     ktext = ""
     try:
@@ -357,9 +399,46 @@ TG_BEK = (5, 10)
 
 
 def tg_job(iid_url_chat):
-    """v1.3: oto-tekrar (5,10 sn) + durum-kayit + nazik-uyarilar."""
+    """v1.5: dev-eserde BUTON-SORUSU (orijinal/yarisi) + oto-tekrar + nezaket."""
     iid, url, chat_id = iid_url_chat
     EB = getattr(KC, "EserBulunamadi", ())
+    secim_kur(iid)
+    meta = None
+    try:
+        meta = KC.eser_meta(url)
+    except Exception as e:
+        if EB and isinstance(e, EB):
+            tg_get("sendMessage", {"chat_id": chat_id,
+                                   "text": "🔎 Bu numarada eser görünmüyor. Linki/numarayı kontrol eder misin? (yayından kalkmış/dijitalleşmemiş olabilir)"})
+            _is_durum(iid, "hata")
+            SECIM.pop(iid, None)
+            return
+        meta = {}
+    olcu = None
+    try:
+        _y = KC.eser_analiz(url)[1]
+        if _y:
+            _pa = _y[0].split("/")
+            _m = KC.dzi_oku(_pa[-1].rsplit(".", 1)[0], "/".join(_pa[:2]))
+            if _m:
+                olcu = (_m[0], _m[1])
+    except Exception:
+        pass
+    dev = bool(olcu and olcu[0] * olcu[1] > 12_000_000)
+    sec = "full"
+    if dev:
+        kb = {"inline_keyboard": [[
+            {"text": "🏛 Orijinal (%dx%d, 1-3 dk)" % olcu, "callback_data": "sec|%s|full" % iid},
+            {"text": "⚡ Yarısı (%dx%d, 30-60 sn)" % (olcu[0] // 2, olcu[1] // 2), "callback_data": "sec|%s|half" % iid}]]}
+        _is_durum(iid, "soru")
+        tg_get("sendMessage", {"chat_id": chat_id,
+                               "text": "🐉 DEV-ESER: %dx%d piksel. Hangisini istersin?\n(10 dk seçim yoksa ORİJİNAL'i getiririm)" % olcu,
+                               "reply_markup": json.dumps(kb)})
+        sec = secim_bekle(iid, 600)
+        if sec == "auto-full":
+            tg_get("sendMessage", {"chat_id": chat_id, "text": "⏰ Seçim gelmedi — ORİJİNAL'i getiriyorum."})
+        SECIM.pop(iid, None)
+        _is_durum(iid, "kuyruk")
     sebep = ""
     for deneme in range(1, 4):
         if deneme > 1:
@@ -370,12 +449,12 @@ def tg_job(iid_url_chat):
             tg_get("sendMessage", {"chat_id": chat_id, "text": cumle})
             time.sleep(bekle)
         try:
-            tg_bir(iid, url, chat_id)
+            tg_bir(iid, url, chat_id, sec=sec, meta=meta, dev=dev, olcu=olcu)
             return
         except Exception as e:
             if EB and isinstance(e, EB):
                 tg_get("sendMessage", {"chat_id": chat_id,
-                                       "text": "🔎 Bu numarada eser görünmüyor. Linki/numarayı kontrol eder misin? (yayından kalkmış/dijitalleşmemiş olabilir)"})
+                                       "text": "🔎 Bu numarada eser görünmüyor. Linki/numarayı kontrol eder misin?"})
                 _is_durum(iid, "hata")
                 return
             ag = isinstance(e, (urllib.error.URLError, TimeoutError, ConnectionError, OSError))
@@ -395,7 +474,7 @@ def tg_job(iid_url_chat):
     if site and not tg:
         m = "🏰 Ketebe sitesine şu an ulaşılamıyor (site taraflı). 10 dk sonra tekrar dener misin?"
     elif not site:
-        m = "😕 Denemelerde olmadı — bağlantıda sorun görünüyor (site/biz tarafı). Biraz sonra tekrar dener misin?"
+        m = "😕 Denemelerde olmadı — bağlantıda sorun görünüyor. Biraz sonra tekrar dener misin?"
     else:
         m = "😕 Denemelerde olmadı; Ketebe yoğun olabilir. Birkaç dakika sonra tekrar dener misin?"
     tg_get("sendMessage", {"chat_id": chat_id, "text": m})
@@ -409,6 +488,19 @@ async def webhook(req: Request):
     try:
         upd = await req.json()
     except Exception:
+        return PlainTextResponse("ok")
+    cq = upd.get("callback_query")
+    if cq:
+        veri = cq.get("data") or ""
+        if veri.startswith("sec|"):
+            parcalar = veri.split("|")
+            if len(parcalar) == 3:
+                _tag, iid, sec = parcalar
+                sx = SECIM.get(iid)
+                if sx and not sx["ev"].is_set():
+                    sx["sec"] = sec
+                    sx["ev"].set()
+                    cb_cevap(cq.get("id", ""), "🏛 Orijinal hazırlanıyor…" if sec == "full" else "⚡ Yarısı hazırlanıyor…")
         return PlainTextResponse("ok")
     m = upd.get("message") or {}
     chat_id = (m.get("chat") or {}).get("id")
